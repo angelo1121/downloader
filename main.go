@@ -1,63 +1,34 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
 	"github.com/gosuri/uiprogress"
 	"github.com/gosuri/uiprogress/util/strutil"
 )
 
-type Downloader struct {
+var refreshRate = time.Millisecond * 200
+
+type PassThru struct {
 	r     io.Reader
-	url   string
 	total uint64
-	bar   *uiprogress.Bar
-	mux   *sync.Mutex
+	mux   *sync.RWMutex
 }
 
-func New(url string) *Downloader {
-	return &Downloader{url: url, mux: new(sync.Mutex)}
-}
-
-func (d *Downloader) Start() error {
-	resp, err := http.Get(d.url)
-	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-
-	bar := uiprogress.AddBar(int(resp.ContentLength)) // Add a new bar
-
-	bar.AppendCompleted()
-	bar.PrependElapsed()
-	bar.PrependFunc(func(b *uiprogress.Bar) string {
-		return strutil.Resize(humanize.Bytes(d.total), 10)
-	})
-
-	d.r = resp.Body
-	d.bar = bar
-
-	// defer bar.Set(int(resp.ContentLength))
-
-	return DownloadFile(d, "avatar.jpg")
-}
-
-func (d *Downloader) Read(p []byte) (int, error) {
-	n, err := d.r.Read(p)
-
-	d.mux.Lock()
-	defer d.mux.Unlock()
-	d.total += uint64(n)
+func (pt *PassThru) Read(p []byte) (int, error) {
+	n, err := pt.r.Read(p)
 
 	if err == nil {
-		// fmt.Println("Read", n, "bytes for a total of", humanize.Bytes(d.total))
+		pt.mux.Lock()
+		pt.total += uint64(n)
+		pt.mux.Unlock()
 	}
-
-	d.bar.Set(int(d.total))
 
 	return n, err
 }
@@ -75,17 +46,58 @@ func DownloadFile(r io.Reader, filepath string) error {
 		return err
 	}
 
-	// fmt.Print("\n")
-
 	return nil
 }
 
 func main() {
-	uiprogress.Start() // start rendering
+	resp, err := http.Get("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
 
-	d := New("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
+	length := resp.ContentLength
 
-	// go func(d *Downloader) {
-	d.Start()
-	// }(d)
+	var mux sync.RWMutex
+
+	pt := &PassThru{r: resp.Body, mux: &mux}
+
+	go func() {
+		DownloadFile(pt, "avatar.jpg")
+	}()
+
+	p := uiprogress.New()
+	p.SetRefreshInterval(refreshRate)
+	p.Start()
+
+	bar := p.AddBar(int(resp.ContentLength)).
+		AppendCompleted().
+		PrependElapsed()
+
+	bar.AppendFunc(func(b *uiprogress.Bar) string {
+		mux.Lock()
+		defer mux.Unlock()
+		return strutil.Resize(humanize.Bytes(pt.total), 10)
+	})
+
+	var total int
+
+	for {
+		mux.Lock()
+		total = int(pt.total)
+		mux.Unlock()
+
+		bar.Set(total)
+
+		if total >= int(length) {
+			break
+		}
+
+		time.Sleep(refreshRate)
+	}
+
+	// bar.Set(total)
+
+	p.Stop()
+	fmt.Println("done")
 }
