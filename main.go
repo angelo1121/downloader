@@ -1,38 +1,91 @@
 package main
 
 import (
-	"fmt"
-	"math/rand"
-	"runtime"
+	"io"
+	"net/http"
+	"os"
 	"sync"
-	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/gosuri/uiprogress"
+	"github.com/gosuri/uiprogress/util/strutil"
 )
 
-func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU()) // use all available cpu cores
+type Downloader struct {
+	r     io.Reader
+	url   string
+	total uint64
+	bar   *uiprogress.Bar
+	mux   *sync.Mutex
+}
 
-	// create a new bar and prepend the task progress to the bar and fanout into 1k go routines
-	count := 1000
-	bar := uiprogress.AddBar(count).AppendCompleted().PrependElapsed()
+func New(url string) *Downloader {
+	return &Downloader{url: url, mux: new(sync.Mutex)}
+}
+
+func (d *Downloader) Start() error {
+	resp, err := http.Get(d.url)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	bar := uiprogress.AddBar(int(resp.ContentLength)) // Add a new bar
+
+	bar.AppendCompleted()
+	bar.PrependElapsed()
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
-		return fmt.Sprintf("Task (%d/%d)", b.Current(), count)
+		return strutil.Resize(humanize.Bytes(d.total), 10)
 	})
 
-	uiprogress.Start()
-	var wg sync.WaitGroup
+	d.r = resp.Body
+	d.bar = bar
 
-	// fanout into go routines
-	for i := 0; i < count; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(time.Millisecond * time.Duration(rand.Intn(1000)))
-			bar.Incr()
-		}()
+	// defer bar.Set(int(resp.ContentLength))
+
+	return DownloadFile(d, "avatar.jpg")
+}
+
+func (d *Downloader) Read(p []byte) (int, error) {
+	n, err := d.r.Read(p)
+
+	d.mux.Lock()
+	defer d.mux.Unlock()
+	d.total += uint64(n)
+
+	if err == nil {
+		// fmt.Println("Read", n, "bytes for a total of", humanize.Bytes(d.total))
 	}
-	time.Sleep(time.Second * 2) // wait for a second for all the go routines to finish
-	wg.Wait()
-	uiprogress.Stop()
+
+	d.bar.Set(int(d.total))
+
+	return n, err
+}
+
+// DownloadFile downloads a file.
+func DownloadFile(r io.Reader, filepath string) error {
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, r)
+	if err != nil {
+		return err
+	}
+
+	// fmt.Print("\n")
+
+	return nil
+}
+
+func main() {
+	uiprogress.Start() // start rendering
+
+	d := New("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
+
+	// go func(d *Downloader) {
+	d.Start()
+	// }(d)
 }
