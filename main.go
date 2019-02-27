@@ -13,11 +13,11 @@ import (
 	"github.com/gosuri/uiprogress/util/strutil"
 )
 
-var refreshRate = time.Millisecond * 200
+const refreshRate = time.Millisecond * 100
 
 type PassThru struct {
 	r     io.Reader
-	total uint64
+	total int
 	mux   *sync.RWMutex
 }
 
@@ -26,7 +26,7 @@ func (pt *PassThru) Read(p []byte) (int, error) {
 
 	if err == nil {
 		pt.mux.Lock()
-		pt.total += uint64(n)
+		pt.total += n
 		pt.mux.Unlock()
 	}
 
@@ -62,29 +62,35 @@ func main() {
 
 	pt := &PassThru{r: resp.Body, mux: &mux}
 
-	go func() {
-		DownloadFile(pt, "avatar.jpg")
-	}()
+	go DownloadFile(pt, "avatar.jpg")
 
 	p := uiprogress.New()
 	p.SetRefreshInterval(refreshRate)
 	p.Start()
 
 	bar := p.AddBar(int(resp.ContentLength)).
-		AppendCompleted().
-		PrependElapsed()
+		AppendCompleted()
+
+	timeStarted := time.Now()
+	bar.PrependFunc(func(b *uiprogress.Bar) string {
+		return strutil.PadLeft(
+			strutil.PrettyTime(time.Since(timeStarted)),
+			5,
+			' ',
+		)
+	})
 
 	bar.AppendFunc(func(b *uiprogress.Bar) string {
 		mux.Lock()
 		defer mux.Unlock()
-		return strutil.Resize(humanize.Bytes(pt.total), 10)
+		return strutil.Resize(humanize.Bytes(uint64(pt.total)), 10)
 	})
 
 	var total int
 
 	for {
 		mux.Lock()
-		total = int(pt.total)
+		total = pt.total
 		mux.Unlock()
 
 		bar.Set(total)
@@ -95,8 +101,6 @@ func main() {
 
 		time.Sleep(refreshRate)
 	}
-
-	// bar.Set(total)
 
 	p.Stop()
 	fmt.Println("done")
