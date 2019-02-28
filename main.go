@@ -13,15 +13,31 @@ import (
 	"github.com/gosuri/uiprogress/util/strutil"
 )
 
-const refreshRate = time.Millisecond * 100
+const refreshRate = time.Millisecond * 1000
 
-type PassThru struct {
-	r     io.Reader
+// PassThru struct
+type passThru struct {
+	r     io.ReadCloser
 	total int
 	mux   *sync.RWMutex
 }
 
-func (pt *PassThru) Read(p []byte) (int, error) {
+// Downloder provides download service
+type downloader struct {
+	pt *passThru
+
+	progress *uiprogress.Progress
+	bar      *uiprogress.Bar
+
+	done chan bool
+}
+
+func newDownloader() *downloader {
+	return &downloader{}
+}
+
+// Read implements io.Reader
+func (pt *passThru) Read(p []byte) (int, error) {
 	n, err := pt.r.Read(p)
 
 	if err == nil {
@@ -34,41 +50,45 @@ func (pt *PassThru) Read(p []byte) (int, error) {
 }
 
 // DownloadFile downloads a file.
-func DownloadFile(r io.Reader, filepath string) error {
+func DownloadFile(pt io.Reader, filepath string, done chan bool) error {
 	out, err := os.Create(filepath)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, r)
+	_, err = io.Copy(out, pt)
 	if err != nil {
 		return err
 	}
 
+	done <- true
 	return nil
 }
 
 func main() {
-	resp, err := http.Get("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
+	// resp, err := http.Get("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
+	resp, err := http.Get("http://ipv4.download.thinkbroadband.com/50MB.zip")
 	if err != nil {
 		panic(err)
 	}
 	defer resp.Body.Close()
 
-	length := resp.ContentLength
+	length := int(resp.ContentLength)
 
 	var mux sync.RWMutex
 
-	pt := &PassThru{r: resp.Body, mux: &mux}
+	pt := &passThru{r: resp.Body, mux: &mux}
 
-	go DownloadFile(pt, "avatar.jpg")
+	done := make(chan bool)
+
+	go DownloadFile(pt, "avatar.zip", done)
 
 	p := uiprogress.New()
 	p.SetRefreshInterval(refreshRate)
 	p.Start()
 
-	bar := p.AddBar(int(resp.ContentLength)).
+	bar := p.AddBar(length).
 		AppendCompleted()
 
 	timeStarted := time.Now()
@@ -86,22 +106,18 @@ func main() {
 		return strutil.Resize(humanize.Bytes(uint64(pt.total)), 10)
 	})
 
-	var total int
-
 	for {
-		mux.Lock()
-		total = pt.total
-		mux.Unlock()
+		select {
+		case <-time.After(refreshRate):
+			mux.Lock()
+			bar.Set(pt.total)
+			mux.Unlock()
 
-		bar.Set(total)
-
-		if total >= int(length) {
-			break
+		case <-done:
+			bar.Set(length)
+			p.Stop()
+			fmt.Println("done")
+			return
 		}
-
-		time.Sleep(refreshRate)
 	}
-
-	p.Stop()
-	fmt.Println("done")
 }
