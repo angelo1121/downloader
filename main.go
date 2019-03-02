@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -12,58 +13,123 @@ import (
 	"github.com/gosuri/uiprogress/util/strutil"
 )
 
-const refreshRate = time.Millisecond * 1000
+type downloadStatus string
 
-// PassThru struct
+const (
+	statusPreparing   downloadStatus = "preparing"
+	statusReady       downloadStatus = "ready"
+	statusDownloading downloadStatus = "downloading"
+	statusDone        downloadStatus = "done"
+)
+
+const refreshRate = time.Millisecond * 1000
+const barLength = 100
+
 type passThru struct {
-	r     io.ReadCloser
-	total int
-	mux   *sync.RWMutex
+	r io.Reader
+
+	barTotal uint8
+
+	total       uint64
+	denominator uint64
+
+	mux *sync.RWMutex
 }
 
 type downloader struct {
+	p  *uiprogress.Progress
 	pt *passThru
-
-	done chan bool
 
 	bar *uiprogress.Bar
 
-	contentLength int
+	url      string
+	filename string
+	status   downloadStatus
+
+	contentLength uint64
+
+	done chan bool
+
+	timeStarted time.Time
+	timeEnded   time.Time
 }
 
-func new(url string, p *uiprogress.Progress) *downloader {
-	resp, err := http.Get(url)
-	if err != nil {
-		panic(err)
-	}
-
-	length := int(resp.ContentLength)
-
-	var mux sync.RWMutex
-
-	pt := &passThru{r: resp.Body, mux: &mux}
-
+func newDownloader(url string, filename string, p *uiprogress.Progress) *downloader {
 	done := make(chan bool)
 
-	bar := p.AddBar(length).AppendCompleted()
+	bar := p.AddBar(barLength).AppendCompleted()
 
+	var mux sync.RWMutex
+	pt := &passThru{mux: &mux}
+
+	d := &downloader{
+		p:        p,
+		pt:       pt,
+		done:     done,
+		bar:      bar,
+		url:      url,
+		filename: filename,
+		status:   statusPreparing,
+	}
+
+	bar.Set(0)
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
 		mux.Lock()
 		defer mux.Unlock()
-		return strutil.Resize(humanize.Bytes(uint64(pt.total)), 10)
+
+		out := fmt.Sprintf("%s/%s", humanize.Bytes(pt.total), humanize.Bytes(d.contentLength))
+
+		return strutil.Resize(out, 15)
+	})
+	bar.PrependFunc(func(b *uiprogress.Bar) string {
+		mux.Lock()
+		defer mux.Unlock()
+
+		return strutil.Resize(string(d.status), 12)
+	})
+	bar.AppendFunc(func(b *uiprogress.Bar) string {
+		mux.Lock()
+		defer mux.Unlock()
+
+		switch d.status {
+		case statusDownloading:
+			return strutil.Resize(strutil.PrettyTime(time.Since(d.timeStarted)), 5)
+		case statusDone:
+			return strutil.Resize(strutil.PrettyTime(d.timeEnded.Sub(d.timeStarted)), 5)
+		default:
+			return strutil.Resize("0s", 5)
+		}
 	})
 
-	return &downloader{
-		pt:            pt,
-		done:          done,
-		bar:           bar,
-		contentLength: length,
-	}
+	return d
 }
 
 func (d *downloader) start() {
+	resp, err := http.Get(d.url)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	d.p.SetRefreshInterval(refreshRate)
+
+	pt := d.pt
+
+	pt.mux.Lock()
+	d.contentLength = uint64(resp.ContentLength)
+	pt.mux.Unlock()
+
+	pt.r = resp.Body
+
+	pt.denominator = d.contentLength / barLength
+
 	go func() {
-		if err := DownloadFile(d.pt, "avatar.zip", d.done); err != nil {
+		pt.mux.Lock()
+		d.timeStarted = time.Now()
+		pt.mux.Unlock()
+
+		d.status = statusDownloading
+		if err := DownloadFile(pt, d.filename, d.done); err != nil {
 			panic(err)
 		}
 	}()
@@ -71,12 +137,20 @@ func (d *downloader) start() {
 	for {
 		select {
 		case <-time.After(refreshRate):
-			d.pt.mux.Lock()
-			d.bar.Set(d.pt.total)
-			d.pt.mux.Unlock()
+			pt.mux.Lock()
+			d.bar.Set(int(pt.barTotal))
+			pt.mux.Unlock()
 
 		case <-d.done:
-			d.bar.Set(d.contentLength)
+			d.bar.Set(barLength)
+
+			pt.mux.Lock()
+			defer pt.mux.Unlock()
+
+			pt.total = d.contentLength
+			d.status = statusDone
+			d.timeEnded = time.Now()
+
 			return
 		}
 	}
@@ -88,19 +162,24 @@ func (pt *passThru) Read(p []byte) (int, error) {
 
 	if err == nil {
 		pt.mux.Lock()
-		pt.total += n
-		pt.mux.Unlock()
+		defer pt.mux.Unlock()
+
+		pt.total += uint64(n)
+
+		barTotal := pt.total / pt.denominator
+
+		if barTotal <= 1 {
+			pt.barTotal = 1
+		} else {
+			pt.barTotal = uint8(barTotal)
+		}
 	}
 
 	return n, err
 }
 
-func (pt *passThru) Close() error {
-	return pt.r.Close()
-}
-
 // DownloadFile downloads a file.
-func DownloadFile(pt io.ReadCloser, filepath string, done chan bool) error {
+func DownloadFile(pt io.Reader, filepath string, done chan bool) error {
 	out, err := os.Create(filepath)
 	if err != nil {
 		return err
@@ -112,34 +191,44 @@ func DownloadFile(pt io.ReadCloser, filepath string, done chan bool) error {
 		return err
 	}
 
-	pt.Close()
-
 	done <- true
 	return nil
 }
 
 func main() {
-	// resp, err := http.Get("https://upload.wikimedia.org/wikipedia/commons/d/d6/Wp-w4-big.jpg")
-	// resp, err := http.Get("http://ipv4.download.thinkbroadband.com/10MB.zip")
-
 	p := uiprogress.New()
-	p.SetRefreshInterval(refreshRate)
 	p.Start()
 
 	var wg sync.WaitGroup
 
-	d1 := new("http://ipv4.download.thinkbroadband.com/10MB.zip", p)
+	d1 := newDownloader("http://ipv4.download.thinkbroadband.com/10MB.zip", "test.zip", p)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		d1.start()
 	}()
 
-	d2 := new("http://ipv4.download.thinkbroadband.com/5MB.zip", p)
+	d2 := newDownloader("http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip", p)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		d2.start()
+	}()
+
+	d3 := newDownloader("http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip", p)
+	wg.Add(1)
+	go func() {
+		time.Sleep(time.Second * 5)
+		defer wg.Done()
+		d3.start()
+	}()
+
+	d4 := newDownloader("http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip", p)
+	wg.Add(1)
+	go func() {
+		time.Sleep(time.Second * 5)
+		defer wg.Done()
+		d4.start()
 	}()
 
 	wg.Wait()
