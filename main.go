@@ -123,9 +123,9 @@ func (d *downloader) start() {
 	go func() {
 		pt.mux.Lock()
 		d.timeStarted = time.Now()
+		d.status = statusDownloading
 		pt.mux.Unlock()
 
-		d.status = statusDownloading
 		if err := DownloadFile(pt, d.filename, d.done); err != nil {
 			panic(err)
 		}
@@ -142,11 +142,10 @@ func (d *downloader) start() {
 			d.bar.Set(barLength)
 
 			pt.mux.Lock()
-			defer pt.mux.Unlock()
-
 			pt.total = d.contentLength
 			d.status = statusDone
 			d.timeEnded = time.Now()
+			pt.mux.Unlock()
 
 			return
 		}
@@ -215,16 +214,16 @@ func main() {
 	d3 := newDownloader("http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip", p)
 	wg.Add(1)
 	go func() {
-		time.Sleep(time.Second * 5)
 		defer wg.Done()
+		time.Sleep(time.Second * 5)
 		d3.start()
 	}()
 
 	d4 := newDownloader("http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip", p)
 	wg.Add(1)
 	go func() {
-		time.Sleep(time.Second * 5)
 		defer wg.Done()
+		time.Sleep(time.Second * 5)
 		d4.start()
 	}()
 
