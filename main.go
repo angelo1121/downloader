@@ -37,7 +37,6 @@ type passThru struct {
 }
 
 type downloader struct {
-	p  *uiprogress.Progress
 	pt *passThru
 
 	bar *uiprogress.Bar
@@ -63,7 +62,6 @@ func newDownloader(url string, filename string, p *uiprogress.Progress) *downloa
 	pt := &passThru{mux: &mux}
 
 	d := &downloader{
-		p:        p,
 		pt:       pt,
 		done:     done,
 		bar:      bar,
@@ -72,7 +70,6 @@ func newDownloader(url string, filename string, p *uiprogress.Progress) *downloa
 		status:   statusPreparing,
 	}
 
-	bar.Set(0)
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
 		mux.Lock()
 		defer mux.Unlock()
@@ -101,6 +98,8 @@ func newDownloader(url string, filename string, p *uiprogress.Progress) *downloa
 		}
 	})
 
+	bar.Set(0)
+
 	return d
 }
 
@@ -110,8 +109,6 @@ func (d *downloader) start() {
 		panic(err)
 	}
 	defer resp.Body.Close()
-
-	d.p.SetRefreshInterval(refreshRate)
 
 	pt := d.pt
 
@@ -230,6 +227,8 @@ func main() {
 		defer wg.Done()
 		d4.start()
 	}()
+
+	p.SetRefreshInterval(refreshRate)
 
 	wg.Wait()
 
