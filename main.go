@@ -57,6 +57,7 @@ func newDownloader(url string, filename string, p *uiprogress.Progress) *downloa
 	done := make(chan bool)
 
 	bar := p.AddBar(barLength).AppendCompleted()
+	bar.Empty = '_'
 
 	var mux sync.RWMutex
 	pt := &passThru{mux: &mux}
@@ -98,6 +99,7 @@ func newDownloader(url string, filename string, p *uiprogress.Progress) *downloa
 		}
 	})
 
+	fmt.Print()
 	bar.Set(0)
 
 	return d
