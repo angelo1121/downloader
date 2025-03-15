@@ -26,6 +26,10 @@ This project demonstrates a simple Golang program that downloads files from the 
 
 2. **Download Dependencies:**
 
+   ```bash
+   go mod download
+   ```
+
    Ensure your module dependencies are up-to-date by running:
 
    ```bash
