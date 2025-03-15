@@ -34,6 +34,14 @@ type passThru struct {
 	denominator uint64
 }
 
+func (pt *passThru) Read(p []byte) (int, error) {
+	n, err := pt.r.Read(p)
+	if err == nil {
+		pt.total += uint64(n)
+	}
+	return n, err
+}
+
 type downloader struct {
 	pt            *passThru
 	bar           *uiprogress.Bar
@@ -117,7 +125,7 @@ func (d *downloader) start() {
 	d.status = statusDownloading
 
 	go func() {
-		if err := downloadFile(d.pt, d.filename, d.done); err != nil {
+		if err := d.output(); err != nil {
 			fmt.Println("Download Error:", err)
 		}
 	}()
@@ -136,27 +144,19 @@ func (d *downloader) start() {
 	}
 }
 
-func (pt *passThru) Read(p []byte) (int, error) {
-	n, err := pt.r.Read(p)
-	if err == nil {
-		pt.total += uint64(n)
-	}
-	return n, err
-}
-
-func downloadFile(pt io.Reader, filepath string, done chan bool) error {
-	out, err := os.Create(filepath)
+func (d downloader) output() error {
+	out, err := os.Create(d.filename)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, pt)
+	_, err = io.Copy(out, d.pt)
 	if err != nil {
 		return err
 	}
 
-	done <- true
+	d.done <- true
 	return nil
 }
 
@@ -170,10 +170,7 @@ func main() {
 		url      string
 		filename string
 	}{
-		{"http://ipv4.download.thinkbroadband.com/10MB.zip", "test1.zip"},
-		{"http://ipv4.download.thinkbroadband.com/5MB.zip", "test2.zip"},
-		{"http://ipv4.download.thinkbroadband.com/5MB.zip", "test3.zip"},
-		{"http://ipv4.download.thinkbroadband.com/5MB.zip", "test4.zip"},
+		{"https://freetestdata.com/wp-content/uploads/2022/11/Free_Test_Data_10.5MB_PDF.pdf", "test1.pdf"},
 	}
 
 	for _, d := range downloaders {
