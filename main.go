@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,24 +23,23 @@ const (
 	statusReady       downloadStatus = "ready"
 	statusDownloading downloadStatus = "downloading"
 	statusDone        downloadStatus = "done"
+	statusError       downloadStatus = "error"
 )
 
 const (
 	refreshRate = time.Second
+	timeout     = 30 * time.Second
 	barLength   = 100
 )
 
 type passThru struct {
-	r           io.Reader
-	total       uint64
-	denominator uint64
+	r     io.Reader
+	total uint64
 }
 
 func (pt *passThru) Read(p []byte) (int, error) {
 	n, err := pt.r.Read(p)
-	if err == nil {
-		pt.total += uint64(n)
-	}
+	pt.total += uint64(n)
 	return n, err
 }
 
@@ -48,14 +49,15 @@ type downloader struct {
 	url           string
 	filename      string
 	contentLength uint64
-	done          chan bool
+	done          chan struct{}
 	timeStarted   time.Time
 	timeEnded     time.Time
 	status        downloadStatus
+	error         error
 }
 
 func newDownloader(url, filename string, p *uiprogress.Progress) *downloader {
-	done := make(chan bool)
+	done := make(chan struct{})
 	bar := p.AddBar(barLength).AppendCompleted()
 	bar.Empty = '_'
 
@@ -69,12 +71,15 @@ func newDownloader(url, filename string, p *uiprogress.Progress) *downloader {
 		status:   statusPreparing,
 	}
 
+	// Download size status
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
 		return strutil.Resize(fmt.Sprintf("%s/%s", humanize.Bytes(pt.total), humanize.Bytes(d.contentLength)), 15)
 	})
+	// Download status: preparing, downloading, done,
 	bar.PrependFunc(func(b *uiprogress.Bar) string {
 		return strutil.Resize(string(d.status), 12)
 	})
+	// Downloading time in seconds
 	bar.AppendFunc(func(b *uiprogress.Bar) string {
 		switch d.status {
 		case statusDownloading:
@@ -85,39 +90,53 @@ func newDownloader(url, filename string, p *uiprogress.Progress) *downloader {
 			return strutil.Resize("0s", 5)
 		}
 	})
+	// Display error message if any
+	bar.AppendFunc(func(b *uiprogress.Bar) string {
+		if d.error != nil {
+			return strutil.Resize(d.error.Error(), 50)
+		}
+
+		return ""
+	})
 
 	return d
 }
 
 func (d *downloader) start() {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", d.url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", d.url, nil)
 	if err != nil {
-		fmt.Println("Request Error:", err)
+		d.fail("new request failed", err)
 		return
 	}
 
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("Get Error:", err)
+		d.fail("sending request failed", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Println("HTTP Error:", resp.Status)
+		d.fail("request failed", errors.New(resp.Status))
 		return
 	}
 
-	contentLength := resp.Header.Get("Content-Length")
-	if contentLength != "" {
-		size, _ := strconv.ParseInt(contentLength, 10, 64)
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		size, err := strconv.ParseInt(contentLength, 10, 64)
+		if err != nil {
+			d.fail("parsing content length failed", err)
+			return
+		}
 		d.contentLength = uint64(size)
-		d.pt.denominator = d.contentLength / barLength
 	} else {
-		fmt.Println("Content-Length header is not set. Unable to determine content size before reading.")
+		d.fail("no content-length", errors.New("unable to determine content size before reading"))
+		return
 	}
 
 	d.pt.r = resp.Body
@@ -125,26 +144,38 @@ func (d *downloader) start() {
 	d.status = statusDownloading
 
 	go func() {
-		if err := d.output(); err != nil {
-			fmt.Println("Download Error:", err)
+		if err = d.output(); err != nil {
+			d.fail("output failed", err)
 		}
 	}()
 
+	ticker := time.NewTicker(refreshRate)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-time.After(refreshRate):
-			d.bar.Set(int(d.pt.total / d.pt.denominator))
+		case <-ticker.C:
+			if err = d.bar.Set(int(float64(d.pt.total) * float64(barLength) / float64(d.contentLength))); err != nil {
+				d.fail("refreshing bar failed", err)
+				return
+			}
 		case <-d.done:
-			d.bar.Set(barLength)
+			if err = d.bar.Set(barLength); err != nil {
+				d.fail("refreshing bar failed", err)
+				return
+			}
 			d.pt.total = d.contentLength
 			d.status = statusDone
 			d.timeEnded = time.Now()
+			return
+		case <-ctx.Done():
+			d.fail("request timeout", ctx.Err())
 			return
 		}
 	}
 }
 
-func (d downloader) output() error {
+func (d *downloader) output() error {
 	out, err := os.Create(d.filename)
 	if err != nil {
 		return err
@@ -153,11 +184,17 @@ func (d downloader) output() error {
 
 	_, err = io.Copy(out, d.pt)
 	if err != nil {
-		return err
+		//return err
+		return fmt.Errorf("copy failed: %w", err)
 	}
 
-	d.done <- true
+	d.done <- struct{}{}
 	return nil
+}
+
+func (d *downloader) fail(ctx string, err error) {
+	d.error = fmt.Errorf("%s: %w", ctx, err)
+	d.status = statusError
 }
 
 func main() {
@@ -166,14 +203,14 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	downloaders := []struct {
+	downloads := []struct {
 		url      string
 		filename string
 	}{
 		{"https://freetestdata.com/wp-content/uploads/2022/11/Free_Test_Data_10.5MB_PDF.pdf", "test1.pdf"},
 	}
 
-	for _, d := range downloaders {
+	for _, d := range downloads {
 		wg.Add(1)
 		go func(url, filename string) {
 			defer wg.Done()
